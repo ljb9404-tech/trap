@@ -9,6 +9,43 @@ from pathlib import Path
 
 DB_PATH = "/Volumes/AI/data/stock_analysis.db"
 
+
+PREDICTION_EXTRA_COLUMNS = [
+    ("interval_hit", "INTEGER"),
+    ("p50_error", "REAL"),
+    ("tail_breach", "INTEGER"),
+    ("tail_breach_side", "TEXT"),
+    ("paper_action", "TEXT"),
+    ("paper_direction", "TEXT"),
+    ("paper_entry_basis", "TEXT"),
+    ("paper_exit_basis", "TEXT"),
+    ("paper_holding_days", "INTEGER"),
+    ("paper_position_size", "REAL"),
+    ("paper_transaction_cost_pct", "REAL"),
+    ("paper_gross_return_pct", "REAL"),
+    ("paper_net_return_pct", "REAL"),
+    ("benchmark_return_pct", "REAL"),
+    ("excess_return_pct", "REAL"),
+]
+
+VALIDATION_EXTRA_COLUMNS = [
+    ("interval_hit_rate", "REAL"),
+    ("avg_paper_net_return", "REAL"),
+    ("paper_long_count", "INTEGER"),
+    ("paper_cash_count", "INTEGER"),
+    ("paper_short_count", "INTEGER"),
+]
+
+
+def ensure_columns(cursor, table, columns):
+    """Add missing columns for existing SQLite DBs."""
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cursor.fetchall()}
+    for name, definition in columns:
+        if name not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -31,6 +68,19 @@ def init_db():
         p10                  REAL,
         p50                  REAL,
         p90                  REAL,
+        -- 예측 구간 검증
+        interval_hit         INTEGER,
+        p50_error            REAL,
+        tail_breach          INTEGER,
+        tail_breach_side     TEXT,
+        -- 검증용 가상 액션 (실거래 신호 아님)
+        paper_action         TEXT,
+        paper_direction      TEXT,
+        paper_entry_basis    TEXT,
+        paper_exit_basis     TEXT,
+        paper_holding_days   INTEGER,
+        paper_position_size  REAL,
+        paper_transaction_cost_pct REAL,
         -- 실제 결과 (target_date 이후 채워짐)
         actual_close         REAL,
         actual_move_pct      REAL,
@@ -39,6 +89,10 @@ def init_db():
         magnitude_error      REAL,
         brier_score          REAL,
         success              INTEGER,
+        paper_gross_return_pct REAL,
+        paper_net_return_pct REAL,
+        benchmark_return_pct REAL,
+        excess_return_pct    REAL,
         pipeline_version     TEXT DEFAULT 'v2',
         created_at           TEXT DEFAULT (datetime('now')),
         UNIQUE(ticker, prediction_date, pipeline_version)
@@ -103,12 +157,20 @@ def init_db():
         direction_hit_rate   REAL,
         avg_magnitude_error  REAL,
         avg_brier_score      REAL,
+        interval_hit_rate    REAL,
+        avg_paper_net_return REAL,
         good_quality_hit_rate   REAL,
         marginal_quality_hit_rate REAL,
         high_confidence_hit_rate  REAL,
+        paper_long_count     INTEGER,
+        paper_cash_count     INTEGER,
+        paper_short_count    INTEGER,
         created_at           TEXT DEFAULT (datetime('now'))
     )
     """)
+
+    ensure_columns(c, "predictions", PREDICTION_EXTRA_COLUMNS)
+    ensure_columns(c, "validation_summary", VALIDATION_EXTRA_COLUMNS)
 
     conn.commit()
     conn.close()
@@ -129,6 +191,7 @@ def import_nvda_v2():
         s = d["scenarios"]
         em = d["expected_move_distribution"]
         v = d["validation"]
+        paper = d.get("paper_action", {})
         try:
             c.execute("""
             INSERT OR IGNORE INTO predictions
@@ -136,19 +199,32 @@ def import_nvda_v2():
              data_quality, confidence, primary_scenario,
              prob_bullish, prob_neutral, prob_bearish,
              p10, p50, p90,
+             paper_action, paper_direction, paper_entry_basis, paper_exit_basis,
+             paper_holding_days, paper_position_size, paper_transaction_cost_pct,
              actual_close, actual_move_pct, realized_scenario,
              direction_hit, magnitude_error, brier_score, success,
+             interval_hit, p50_error, tail_breach, tail_breach_side,
+             paper_gross_return_pct, paper_net_return_pct, benchmark_return_pct, excess_return_pct,
              pipeline_version)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 d["ticker"], d["prediction_date"], d["target_date"],
                 d["horizon_trading_days"], d["reference_price"],
                 d["data_quality"], d["confidence"], d["primary_scenario"],
                 s["bullish"]["probability"], s["neutral"]["probability"], s["bearish"]["probability"],
                 em["p10"], em["p50"], em["p90"],
+                paper.get("action"), paper.get("direction"),
+                paper.get("entry_basis"), paper.get("exit_basis"),
+                paper.get("holding_period_trading_days"),
+                paper.get("position_size"),
+                paper.get("transaction_cost_pct_round_trip"),
                 v["actual_close_on_target_date"], v["actual_move_pct"],
                 v["realized_scenario"], v["direction_hit"],
                 v["magnitude_error"], v["brier_score"], v["success"],
+                v.get("interval_hit"), v.get("p50_error"),
+                v.get("tail_breach"), v.get("tail_breach_side"),
+                v.get("paper_gross_return_pct"), v.get("paper_net_return_pct"),
+                v.get("benchmark_return_pct"), v.get("excess_return_pct"),
                 "v2"
             ))
             print(f"  predictions: NVDA 2026-05-04 import 완료")
@@ -197,6 +273,10 @@ def import_nvda_v2():
         with open(ev_file) as f:
             d = json.load(f)
         count = 0
+        c.execute(
+            "DELETE FROM evidence WHERE ticker=? AND analysis_date=?",
+            (d["ticker"], d["as_of"])
+        )
         for claim in d.get("validated_claims", []) + d.get("excluded_claims", []):
             try:
                 c.execute("""
